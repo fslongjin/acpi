@@ -75,6 +75,7 @@ pub mod madt;
 pub mod mcfg;
 pub mod rsdp;
 pub mod sdt;
+pub mod spcr;
 
 #[cfg(feature = "allocator_api")]
 mod managed_slice;
@@ -489,7 +490,7 @@ where
             };
             let r = header_mapping.validate(header_mapping.signature);
             if r.is_err() {
-                log::warn!("Found invalid SSDT at physical address {:p}: {:?}", table_phys_ptr, r);
+                log::warn!("Found invalid SDT at physical address {:p}: {:?}", table_phys_ptr, r);
                 continue;
             }
             let result = header_mapping.clone();

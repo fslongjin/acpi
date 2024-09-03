@@ -1,4 +1,4 @@
-use crate::{misc::ArgNum, AmlContext, AmlError, AmlHandle, AmlName};
+use crate::{misc::ArgNum, opregion::OpRegion, AmlContext, AmlError, AmlHandle};
 use alloc::{
     string::{String, ToString},
     sync::Arc,
@@ -7,21 +7,6 @@ use alloc::{
 use bit_field::BitField;
 use core::{cmp, fmt, fmt::Debug};
 use spinning_top::Spinlock;
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum RegionSpace {
-    SystemMemory,
-    SystemIo,
-    PciConfig,
-    EmbeddedControl,
-    SMBus,
-    SystemCmos,
-    PciBarTarget,
-    IPMI,
-    GeneralPurposeIo,
-    GenericSerialBus,
-    OemDefined(u8),
-}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FieldAccessType {
@@ -181,12 +166,7 @@ pub enum AmlValue {
     /// Describes an operation region. Some regions require other objects to be declared under their parent device
     /// (e.g. an `_ADR` object for a `PciConfig` region), in which case an absolute path to the object is stored in
     /// `parent_device`.
-    OpRegion {
-        region: RegionSpace,
-        offset: u64,
-        length: u64,
-        parent_device: Option<AmlName>,
-    },
+    OpRegion(OpRegion),
     /// Describes a field unit within an operation region.
     Field {
         region: AmlHandle,
@@ -280,15 +260,16 @@ impl AmlValue {
         }
     }
 
-    pub fn as_bool(&self) -> Result<bool, AmlError> {
+    pub fn as_bool(&self, context: &mut AmlContext) -> Result<bool, AmlError> {
         match self {
             AmlValue::Boolean(value) => Ok(*value),
             AmlValue::Integer(value) => Ok(*value != 0),
+            AmlValue::Field{ .. } => Ok(self.as_integer(context)? != 0),
             _ => Err(AmlError::IncompatibleValueConversion { current: self.type_of(), target: AmlType::Integer }),
         }
     }
 
-    pub fn as_integer(&self, context: &AmlContext) -> Result<u64, AmlError> {
+    pub fn as_integer(&self, context: &mut AmlContext) -> Result<u64, AmlError> {
         match self {
             AmlValue::Integer(value) => Ok(*value),
             AmlValue::Boolean(value) => Ok(if *value { u64::max_value() } else { 0 }),
@@ -320,7 +301,7 @@ impl AmlValue {
         }
     }
 
-    pub fn as_buffer(&self, context: &AmlContext) -> Result<Arc<Spinlock<Vec<u8>>>, AmlError> {
+    pub fn as_buffer(&self, context: &mut AmlContext) -> Result<Arc<Spinlock<Vec<u8>>>, AmlError> {
         match self {
             AmlValue::Buffer(ref bytes) => Ok(bytes.clone()),
             // TODO: implement conversion of String and Integer to Buffer
@@ -330,7 +311,7 @@ impl AmlValue {
         }
     }
 
-    pub fn as_string(&self, context: &AmlContext) -> Result<String, AmlError> {
+    pub fn as_string(&self, context: &mut AmlContext) -> Result<String, AmlError> {
         match self {
             AmlValue::String(ref string) => Ok(string.clone()),
             // TODO: implement conversion of Buffer to String
@@ -404,7 +385,7 @@ impl AmlValue {
     ///     `Integer` from: `Buffer`, `BufferField`, `DdbHandle`, `FieldUnit`, `String`, `Debug`
     ///     `Package` from: `Debug`
     ///     `String` from: `Integer`, `Buffer`, `Debug`
-    pub fn as_type(&self, desired_type: AmlType, context: &AmlContext) -> Result<AmlValue, AmlError> {
+    pub fn as_type(&self, desired_type: AmlType, context: &mut AmlContext) -> Result<AmlValue, AmlError> {
         // If the value is already of the correct type, just return it as is
         if self.type_of() == desired_type {
             return Ok(self.clone());
@@ -421,99 +402,29 @@ impl AmlValue {
         }
     }
 
-    /// Reads from a field of an opregion, returning either a `AmlValue::Integer` or an `AmlValue::Buffer`,
+    /// Reads from a field of an op-region, returning either a `AmlValue::Integer` or an `AmlValue::Buffer`,
     /// depending on the size of the field.
-    pub fn read_field(&self, context: &AmlContext) -> Result<AmlValue, AmlError> {
+    pub fn read_field(&self, context: &mut AmlContext) -> Result<AmlValue, AmlError> {
         if let AmlValue::Field { region, flags, offset, length } = self {
-            let _maximum_access_size = {
-                if let AmlValue::OpRegion { region, .. } = context.namespace.get(*region)? {
-                    match region {
-                        RegionSpace::SystemMemory => 64,
-                        RegionSpace::SystemIo | RegionSpace::PciConfig => 32,
-                        _ => unimplemented!(),
-                    }
-                } else {
-                    return Err(AmlError::FieldRegionIsNotOpRegion);
-                }
-            };
-            let minimum_access_size = match flags.access_type()? {
-                FieldAccessType::Any => 8,
-                FieldAccessType::Byte => 8,
-                FieldAccessType::Word => 16,
-                FieldAccessType::DWord => 32,
-                FieldAccessType::QWord => 64,
-                FieldAccessType::Buffer => 8, // TODO
-            };
-
-            /*
-             * Find the access size, as either the minimum access size allowed by the region, or the field length
-             * rounded up to the next power-of-2, whichever is larger.
-             */
-            let access_size = u64::max(minimum_access_size, length.next_power_of_two());
-
-            /*
-             * TODO: we need to decide properly how to read from the region itself. Complications:
-             *    - if the region has a minimum access size greater than the desired length, we need to read the
-             *      minimum and mask it (reading a byte from a WordAcc region)
-             *    - if the desired length is larger than we can read, we need to do multiple reads
-             */
-            Ok(AmlValue::Integer(
-                context.read_region(*region, *offset, access_size)?.get_bits(0..(*length as usize)),
-            ))
+            if let AmlValue::OpRegion(region) = context.namespace.get(*region)?.clone() {
+                region.read_field(*offset, *length, *flags, context)
+            } else {
+                Err(AmlError::FieldRegionIsNotOpRegion)
+            }
         } else {
             Err(AmlError::IncompatibleValueConversion { current: self.type_of(), target: AmlType::FieldUnit })
         }
     }
 
+    /// Write to a field of an op-region, from either a `AmlValue::Integer` or `AmlValue::Buffer`
+    /// as necessary.
     pub fn write_field(&mut self, value: AmlValue, context: &mut AmlContext) -> Result<(), AmlError> {
-        /*
-         * If the field's update rule is `Preserve`, we need to read the initial value of the field, so we can
-         * overwrite the correct bits. We destructure the field to do the actual write, so we read from it if
-         * needed here, otherwise the borrow-checker doesn't understand.
-         */
-        let field_update_rule = if let AmlValue::Field { flags, .. } = self {
-            flags.field_update_rule()?
-        } else {
-            return Err(AmlError::IncompatibleValueConversion {
-                current: self.type_of(),
-                target: AmlType::FieldUnit,
-            });
-        };
-        let mut field_value = match field_update_rule {
-            FieldUpdateRule::Preserve => self.read_field(context)?.as_integer(context)?,
-            FieldUpdateRule::WriteAsOnes => 0xffffffff_ffffffff,
-            FieldUpdateRule::WriteAsZeros => 0x0,
-        };
-
         if let AmlValue::Field { region, flags, offset, length } = self {
-            let _maximum_access_size = {
-                if let AmlValue::OpRegion { region, .. } = context.namespace.get(*region)? {
-                    match region {
-                        RegionSpace::SystemMemory => 64,
-                        RegionSpace::SystemIo | RegionSpace::PciConfig => 32,
-                        _ => unimplemented!(),
-                    }
-                } else {
-                    return Err(AmlError::FieldRegionIsNotOpRegion);
-                }
-            };
-            let minimum_access_size = match flags.access_type()? {
-                FieldAccessType::Any => 8,
-                FieldAccessType::Byte => 8,
-                FieldAccessType::Word => 16,
-                FieldAccessType::DWord => 32,
-                FieldAccessType::QWord => 64,
-                FieldAccessType::Buffer => 8, // TODO
-            };
-
-            /*
-             * Find the access size, as either the minimum access size allowed by the region, or the field length
-             * rounded up to the next power-of-2, whichever is larger.
-             */
-            let access_size = u64::max(minimum_access_size, length.next_power_of_two());
-
-            field_value.set_bits(0..(*length as usize), value.as_integer(context)?);
-            context.write_region(*region, *offset, access_size, field_value)
+            if let AmlValue::OpRegion(region) = context.namespace.get(*region)?.clone() {
+                region.write_field(*offset, *length, *flags, value, context)
+            } else {
+                Err(AmlError::FieldRegionIsNotOpRegion)
+            }
         } else {
             Err(AmlError::IncompatibleValueConversion { current: self.type_of(), target: AmlType::FieldUnit })
         }
@@ -642,8 +553,6 @@ impl Args {
     pub const EMPTY: Self = Self([None, None, None, None, None, None, None]);
 
     pub fn from_list(list: Vec<AmlValue>) -> Result<Args, AmlError> {
-        use core::convert::TryInto;
-
         if list.len() > 7 {
             return Err(AmlError::TooManyArgs);
         }

@@ -15,7 +15,7 @@ use alloc::{
     vec,
     vec::Vec,
 };
-use core::{cmp::Ordering, convert::TryInto, mem, ops::Deref};
+use core::{cmp::Ordering, mem, ops::Deref};
 
 pub fn expression_opcode<'a, 'c>() -> impl Parser<'a, 'c, AmlValue>
 where
@@ -331,7 +331,7 @@ where
             DebugVerbosity::AllScopes,
             "DefIncrement",
             super_name().map_with_context(|addend, context| {
-                let value = try_with_context!(context, context.read_target(&addend));
+                let value = try_with_context!(context, context.read_target(&addend)).clone();
                 let value = try_with_context!(context, value.as_integer(context));
                 let new_value = AmlValue::Integer(value + 1);
                 try_with_context!(context, context.store(addend, new_value.clone()));
@@ -353,7 +353,7 @@ where
             DebugVerbosity::AllScopes,
             "DefDecrement",
             super_name().map_with_context(|minuend, context| {
-                let value = try_with_context!(context, context.read_target(&minuend));
+                let value = try_with_context!(context, context.read_target(&minuend)).clone();
                 let value = try_with_context!(context, value.as_integer(context));
                 let new_value = AmlValue::Integer(value - 1);
                 try_with_context!(context, context.store(minuend, new_value.clone()));
@@ -376,8 +376,8 @@ where
             DebugVerbosity::AllScopes,
             "DefLOr",
             term_arg().then(term_arg()).map_with_context(|(left_arg, right_arg), context| {
-                let left = try_with_context!(context, left_arg.as_bool());
-                let right = try_with_context!(context, right_arg.as_bool());
+                let left = try_with_context!(context, left_arg.as_bool(context));
+                let right = try_with_context!(context, right_arg.as_bool(context));
                 (Ok(AmlValue::Boolean(left && right)), context)
             }),
         ))
@@ -397,8 +397,8 @@ where
             DebugVerbosity::AllScopes,
             "DefLOr",
             term_arg().then(term_arg()).map_with_context(|(left_arg, right_arg), context| {
-                let left = try_with_context!(context, left_arg.as_bool());
-                let right = try_with_context!(context, right_arg.as_bool());
+                let left = try_with_context!(context, left_arg.as_bool(context));
+                let right = try_with_context!(context, right_arg.as_bool(context));
                 (Ok(AmlValue::Boolean(left || right)), context)
             }),
         ))
@@ -418,7 +418,7 @@ where
             DebugVerbosity::AllScopes,
             "DefLNot",
             term_arg().map_with_context(|arg, context| {
-                let operand = try_with_context!(context, arg.as_bool());
+                let operand = try_with_context!(context, arg.as_bool(context));
                 (Ok(AmlValue::Boolean(!operand)), context)
             }),
         ))
@@ -811,6 +811,9 @@ where
                 AmlValue::Integer(value) => AmlValue::Integer(value),
                 AmlValue::Buffer(data) => {
                     AmlValue::Integer(try_with_context!(context, AmlValue::Buffer(data).as_integer(context)))
+                }
+                AmlValue::Field { .. } => {
+                    AmlValue::Integer(try_with_context!(context, operand.as_integer(context)))
                 }
                 AmlValue::String(string) => AmlValue::Integer(try_with_context!(
                     context,
